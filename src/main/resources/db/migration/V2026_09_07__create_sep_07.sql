@@ -1,0 +1,1 @@
+CREATE TABLE sep_07 (id uuid PRIMARY KEY);

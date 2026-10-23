@@ -1,0 +1,254 @@
+name: Verify Migrations
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'src/main/resources/db/migration/**'
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'src/main/resources/db/migration/**'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to verify (empty verifies every open PR with migrations)'
+        required: false
+
+permissions: {}
+
+env:
+  MIGRATION_DIR: src/main/resources/db/migration
+
+jobs:
+  verify:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.pr_number != '')
+    name: Verify Migration Order
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: write
+      pull-requests: write
+    concurrency:
+      group: verify-migrations-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Verify
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          # language=javascript
+          script: |
+            const PATTERN = /^V(\d{4})_(\d{2})_(\d{2,})__\w+\.sql$/;
+            const STATUS_CONTEXT = 'migrations/order';
+            const COMMENT_MARKER = '<!-- verify-migrations -->';
+            const DOCUMENTATION = 'https://documentation.gokadmos.dev/engineering/development/backend/create_database_migration_scripts/';
+            const IMMUTABLE = 'merged migrations are immutable, add a new one instead.';
+            const { MIGRATION_DIR, PR_NUMBER, RUN_URL } = process.env;
+            const { owner, repo } = context.repo;
+            const defaultBranch = context.payload.repository.default_branch;
+
+            const parse = name => PATTERN.exec(name)?.slice(1, 4).map(Number);
+            const compare = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+            const monthOf = version => version[0] * 100 + version[1];
+            const pad = number => String(number).padStart(2, '0');
+            const label = ([year, month, number]) => `V${year}_${pad(month)}_${pad(number)}`;
+            const renamed = (name, version) => label(version) + name.slice(name.indexOf('__'));
+            const following = (previous, month) =>
+              [...month, previous && monthOf(previous) === monthOf(month) ? previous[2] + 1 : 1];
+            const baseName = path => path.slice(path.lastIndexOf('/') + 1);
+            const inDir = path => path?.startsWith(`${MIGRATION_DIR}/`) ?? false;
+
+            function evaluate(prFiles, reference) {
+              const violations = [];
+              const versions = new Map();
+              let latest;
+              for (const name of Object.keys(reference)) {
+                const version = parse(name);
+                if (!version) continue;
+                if (!versions.has(label(version))) versions.set(label(version), name);
+                if (!latest || compare(version, latest) > 0) latest = version;
+              }
+
+              const added = [];
+              for (const file of prFiles) {
+                const name = baseName(file.filename);
+                if (file.status === 'renamed' && inDir(file.previous_filename)) {
+                  violations.push(`\`${baseName(file.previous_filename)}\` was renamed to \`${name}\`: ${IMMUTABLE}`);
+                  continue;
+                }
+                if (['removed', 'modified', 'changed'].includes(file.status)) {
+                  violations.push(`\`${name}\` was ${file.status === 'removed' ? 'deleted' : 'modified'}: ${IMMUTABLE}`);
+                  continue;
+                }
+                if (reference[name] === file.sha) continue;
+                const version = parse(name);
+                if (!version || file.filename.includes('/', MIGRATION_DIR.length + 1)) {
+                  violations.push(`\`${name}\` has an invalid name: expected \`V<YYYY>_<MM>_<NN>__<description>.sql\` directly in \`${MIGRATION_DIR}\`.`);
+                  continue;
+                }
+                added.push({ version, name });
+              }
+              added.sort((a, b) => compare(a.version, b.version) || a.name.localeCompare(b.name));
+
+              const seen = new Map();
+              const ordered = [];
+              for (const { version, name } of added) {
+                const key = label(version);
+                if (versions.has(key)) {
+                  violations.push(`\`${name}\` conflicts with existing \`${versions.get(key)}\`: version ${key} is already taken.`);
+                } else if (seen.has(key)) {
+                  violations.push(`\`${name}\` conflicts with \`${seen.get(key)}\` in this PR: version ${key} is used twice.`);
+                } else if (latest && compare(version, latest) < 0) {
+                  violations.push(`\`${name}\` is older than the latest existing migration \`${versions.get(label(latest))}\`: Flyway refuses migrations older than an applied one.`);
+                } else {
+                  ordered.push({ version, name });
+                }
+                if (!seen.has(key)) seen.set(key, name);
+              }
+
+              let previous = latest;
+              for (const { version, name } of ordered) {
+                const expected = following(previous, version.slice(0, 2));
+                if (compare(version, expected) !== 0) {
+                  violations.push(`\`${name}\` breaks the sequence: expected ${label(expected)} (numbers are consecutive within ${version[0]}_${pad(version[1])} and start at 01 in a new month).`);
+                }
+                previous = version;
+              }
+
+              const suggestions = [];
+              if (violations.length) {
+                let previous = latest;
+                for (const { version, name } of added) {
+                  const month = previous && monthOf(previous) > monthOf(version) ? previous.slice(0, 2) : version.slice(0, 2);
+                  const suggested = following(previous, month);
+                  if (compare(suggested, version) !== 0) suggestions.push([name, renamed(name, suggested)]);
+                  previous = suggested;
+                }
+              }
+              return { violations, suggestions };
+            }
+
+            async function migrations(ref) {
+              try {
+                const { data } = await github.rest.git.getTree({ owner, repo, tree_sha: `${ref}:${MIGRATION_DIR}` });
+                return Object.fromEntries(data.tree.filter(entry => entry.type === 'blob').map(entry => [entry.path, entry.sha]));
+              } catch (error) {
+                if (error.status === 404) return {};
+                throw error;
+              }
+            }
+
+            function commentBody(violations, suggestions, refs) {
+              if (!violations.length) return undefined;
+              const lines = [
+                COMMENT_MARKER,
+                '### :x: Migration order check failed',
+                '',
+                `Compared with ${refs.map(ref => `\`${ref}\``).join(' and ')} at the time of [this run](${RUN_URL}).`,
+                '',
+                ...violations.map(violation => `- ${violation}`),
+              ];
+              if (suggestions.length) {
+                lines.push('', '**Suggested renames**', '', '| Current | Rename to |', '|---|---|');
+                lines.push(...suggestions.map(([current, target]) => `| \`${current}\` | \`${target}\` |`));
+              }
+              lines.push('', `See the [migration guidelines](${DOCUMENTATION}).`);
+              return lines.join('\n');
+            }
+
+            async function report(pr, violations, body) {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha: pr.head.sha,
+                state: violations.length ? 'failure' : 'success',
+                context: STATUS_CONTEXT,
+                description: (violations[0] ?? 'Migrations are in order').replaceAll('`', '').slice(0, 140),
+                target_url: RUN_URL,
+              });
+
+              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+              const existing = comments.find(comment => comment.body?.includes(COMMENT_MARKER) && comment.user?.login === 'github-actions[bot]');
+              if (body && existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else if (body) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+              } else if (existing) {
+                await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
+              }
+            }
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: Number(PR_NUMBER) });
+            const files = (await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 }))
+              .filter(file => inDir(file.filename) || inDir(file.previous_filename));
+            if (pr.state !== 'open' || !files.length) {
+              core.info(`PR #${pr.number}: ${pr.state !== 'open' ? 'not open' : 'no migration changes'}, skipped`);
+              return;
+            }
+
+            const target = pr.base.ref;
+            const master = await migrations(defaultBranch);
+            const reference = target === defaultBranch ? master : { ...master, ...(await migrations(target)) };
+            const refs = target === defaultBranch ? [target] : [target, defaultBranch];
+            const { violations, suggestions } = evaluate(files, reference);
+            const body = commentBody(violations, suggestions, refs);
+
+            await report(pr, violations, body);
+            core.info(`PR #${pr.number}: ${violations.length} violation(s)`);
+            violations.forEach(violation => core.info(`  - ${violation}`));
+            await core.summary.addRaw(`## PR #${pr.number}\n\n${body ?? ':white_check_mark: Migrations are in order'}\n`).write();
+
+  dispatch-affected:
+    if: (github.event_name == 'push' && !github.event.deleted) || (github.event_name == 'workflow_dispatch' && inputs.pr_number == '')
+    name: Dispatch Verification for Affected PRs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+    concurrency:
+      group: verify-migrations-dispatch-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Dispatch
+        uses: actions/github-script@v9
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        with:
+          # language=javascript
+          script: |
+            const { MIGRATION_DIR, WORKFLOW_REF } = process.env;
+            const { owner, repo } = context.repo;
+            const defaultBranch = context.payload.repository.default_branch;
+            const branch = context.ref.replace(/^refs\/heads\//, '');
+            const workflow = WORKFLOW_REF.split('@')[0].split('/').pop();
+            const inDir = path => path?.startsWith(`${MIGRATION_DIR}/`) ?? false;
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+              ...(branch === defaultBranch ? {} : { base: branch }),
+            });
+
+            for (const pr of prs) {
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+              if (!files.some(file => inDir(file.filename) || inDir(file.previous_filename))) continue;
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: workflow,
+                ref: defaultBranch,
+                inputs: { pr_number: String(pr.number) },
+              });
+              core.info(`PR #${pr.number}: verification dispatched`);
+            }

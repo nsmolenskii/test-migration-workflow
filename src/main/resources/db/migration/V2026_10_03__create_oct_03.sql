@@ -1,0 +1,1 @@
+CREATE TABLE oct_03 (id uuid PRIMARY KEY);
