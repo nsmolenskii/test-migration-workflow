@@ -1,0 +1,1 @@
+ALTER TABLE sep_07 ADD COLUMN note text;
