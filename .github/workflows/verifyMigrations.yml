@@ -2,7 +2,7 @@ name: Verify Migrations
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
     paths:
       - 'src/main/resources/db/migration/**'
   push:
@@ -23,7 +23,7 @@ env:
 
 jobs:
   verify:
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.pr_number != '')
+    if: (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null)) || (github.event_name == 'workflow_dispatch' && inputs.pr_number != '')
     name: Verify Migration Order
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -44,7 +44,7 @@ jobs:
         with:
           # language=javascript
           script: |
-            const PATTERN = /^V(\d{4})_(\d{2})_(\d{2,})__\w+\.sql$/;
+            const PATTERN = /^V(\d{4})_(0[1-9]|1[0-2])_(\d{2,})__\w+\.sql$/;
             const STATUS_CONTEXT = 'migrations/order';
             const COMMENT_MARKER = '<!-- verify-migrations -->';
             const DOCUMENTATION = 'https://documentation.gokadmos.dev/engineering/development/backend/create_database_migration_scripts/';
@@ -86,9 +86,10 @@ jobs:
                   violations.push(`\`${name}\` was ${file.status === 'removed' ? 'deleted' : 'modified'}: ${IMMUTABLE}`);
                   continue;
                 }
-                if (reference[name] === file.sha) continue;
+                const nested = file.filename.includes('/', MIGRATION_DIR.length + 1);
+                if (!nested && reference[name] === file.sha) continue;
                 const version = parse(name);
-                if (!version || file.filename.includes('/', MIGRATION_DIR.length + 1)) {
+                if (!version || nested) {
                   violations.push(`\`${name}\` has an invalid name: expected \`V<YYYY>_<MM>_<NN>__<description>.sql\` directly in \`${MIGRATION_DIR}\`.`);
                   continue;
                 }
