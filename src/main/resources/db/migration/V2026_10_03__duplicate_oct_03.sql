@@ -1,0 +1,1 @@
+ALTER TABLE oct_03 ADD COLUMN note text;
